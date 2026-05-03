@@ -21,6 +21,8 @@
 - 圖片與檔案只傳 URL，不直接傳內容
 - Enter 可發送訊息
 - 即時顯示收到的 MQTT 訊息
+- 氣泡會顯示訊息裡的 `user` 名字
+- 自己送出的訊息顯示在右邊，其他人的訊息顯示在左邊
 
 ## 介面引導
 
@@ -32,6 +34,17 @@ App 開啟後會顯示三個使用步驟：
 
 同一組 `invite_code` 的使用者會進入同一間聊天室。
 
+## 連線行為
+
+App 會先連上固定的 broker，再訂閱聊天室 topic。只有訂閱成功後，輸入框才會啟用，避免還沒準備好就送訊息。
+
+斷線時會自動重連同一個 broker，重連成功後會重新訂閱原本的聊天室。為了確保大家在同一間聊天室，App 不會自動切換到其他 broker。
+
+同一間聊天室需要兩個條件都一樣：
+
+- Broker WebSocket URL 一樣
+- `invite_code` 一樣
+
 ## 執行
 
 ```bash
@@ -42,12 +55,15 @@ python app.py
 預設 broker：
 
 ```text
-wss://broker.hivemq.com:8884/mqtt
+wss://broker.emqx.io:8084/mqtt
 ```
 
-也可改成：
+如果預設 broker 真的無法連線，可以手動改成其他 public broker；但同聊天室的所有人也要一起改成同一個 URL：
 
 ```text
+wss://broker.emqx.io:8084/mqtt
+ws://broker.emqx.io:8083/mqtt
+wss://broker.hivemq.com:8884/mqtt
 ws://broker.hivemq.com:8000/mqtt
 ws://broker.mqttdashboard.com:8000/mqtt
 ```

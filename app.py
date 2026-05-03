@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 try:
     import paho.mqtt.client as mqtt
-    from PyQt6.QtCore import QObject, QSize, Qt, pyqtSignal
+    from PyQt6.QtCore import QObject, QSize, Qt, QTimer, pyqtSignal
     from PyQt6.QtWidgets import (
         QApplication,
         QFrame,
@@ -32,7 +32,7 @@ except ImportError as error:
     sys.exit(1)
 
 
-DEFAULT_BROKER_URL = "wss://broker.hivemq.com:8884/mqtt"
+DEFAULT_BROKER_URL = "wss://broker.emqx.io:8084/mqtt"
 INVITE_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -52,6 +52,13 @@ class MqttBridge(QObject):
         self.client = None
         self.invite_code = ""
         self.user = ""
+        self.room_ready = False
+        self.pending_subscribe_mid = None
+        self.broker_url = ""
+        self.connect_started_at = 0
+        self.watchdog = QTimer(self)
+        self.watchdog.setInterval(2500)
+        self.watchdog.timeout.connect(self._watch_connection)
 
     def connect_room(self, broker_url: str, invite_code: str, user: str):
         broker_url = broker_url.strip()
@@ -67,40 +74,23 @@ class MqttBridge(QObject):
         self.disconnect_room(emit_status=False)
         self.invite_code = invite_code
         self.user = user
-
-        parsed = urlparse(broker_url)
-        host = parsed.hostname
-        port = parsed.port or (8884 if parsed.scheme == "wss" else 8000)
-        path = parsed.path or "/mqtt"
-
-        if not host:
-            raise ValueError("Broker URL 缺少 host。")
-
-        client_id = f"python-qt-chat-{random.randrange(16**8):08x}-{int(time.time())}"
-        client = self._create_client(client_id)
-        client.ws_set_options(path=path)
-
-        if parsed.scheme == "wss":
-            client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
-
-        client.on_connect = self._on_connect
-        client.on_disconnect = self._on_disconnect
-        client.on_message = self._on_message
-
-        self.client = client
-        self.status_changed.emit("connecting", f"連線中：{broker_url}")
-
-        client.connect_async(host, port, keepalive=30)
-        client.loop_start()
+        self.room_ready = False
+        self.pending_subscribe_mid = None
+        self.broker_url = broker_url
+        self._start_client()
 
     def disconnect_room(self, emit_status: bool = True):
+        self.watchdog.stop()
         if self.client:
             old_client = self.client
             self.client = None
-            old_client.loop_stop()
+            self.room_ready = False
+            self.pending_subscribe_mid = None
             old_client.disconnect()
+            old_client.loop_stop()
 
         self.invite_code = ""
+        self.broker_url = ""
 
         if emit_status:
             self.status_changed.emit("disconnected", "已離開聊天室。")
@@ -119,39 +109,74 @@ class MqttBridge(QObject):
         )
 
     def publish_message(self, message: dict):
-        if not self.client or not self.client.is_connected() or not self.invite_code:
-            raise RuntimeError("尚未連上聊天室。")
+        if not self.client or not self.client.is_connected() or not self.room_ready:
+            raise RuntimeError("聊天室尚未準備好，請等狀態顯示已加入後再傳送。")
 
         topic = f"chat/{self.invite_code}/msg"
-        self.client.publish(topic, json.dumps(message, ensure_ascii=False), qos=0, retain=False)
+        info = self.client.publish(topic, json.dumps(message, ensure_ascii=False), qos=0, retain=False)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError(f"訊息送出失敗，錯誤碼：{info.rc}")
 
     def _create_client(self, client_id: str):
         try:
             return mqtt.Client(
                 mqtt.CallbackAPIVersion.VERSION2,
                 client_id=client_id,
+                clean_session=True,
                 transport="websockets",
+                protocol=mqtt.MQTTv311,
             )
         except (AttributeError, TypeError):
-            return mqtt.Client(client_id=client_id, transport="websockets")
+            return mqtt.Client(
+                client_id=client_id,
+                clean_session=True,
+                transport="websockets",
+                protocol=mqtt.MQTTv311,
+            )
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
         if client is not self.client:
             return
 
+        self.room_ready = False
         if not self._connect_success(reason_code):
             self.status_changed.emit("error", f"連線失敗：{reason_code}")
             return
 
+        self.connect_started_at = time.monotonic()
         topic = f"chat/{self.invite_code}/#"
-        client.subscribe(topic, qos=0)
+        result, mid = client.subscribe(topic, qos=0)
+        if result != mqtt.MQTT_ERR_SUCCESS:
+            self.status_changed.emit("error", f"訂閱失敗，錯誤碼：{result}")
+            return
+
+        self.pending_subscribe_mid = mid
+        self.status_changed.emit("subscribing", f"已連上 broker，正在訂閱 {topic}")
+
+    def _on_subscribe(self, client, userdata, mid, *args):
+        if client is not self.client or mid != self.pending_subscribe_mid:
+            return
+
+        self.room_ready = True
+        self.pending_subscribe_mid = None
         self.status_changed.emit("connected", f"已加入聊天室 {self.invite_code}")
+
+    def _on_connect_fail(self, client, userdata):
+        if client is not self.client:
+            return
+
+        self.room_ready = False
+        self.connect_started_at = time.monotonic()
+        self.status_changed.emit("offline", "連線失敗，會繼續重試同一個 broker。")
 
     def _on_disconnect(self, client, userdata, *args):
         if client is not self.client:
             return
 
-        self.status_changed.emit("offline", "連線已中斷，MQTT 會嘗試重連。")
+        self.room_ready = False
+        self.pending_subscribe_mid = None
+        self.connect_started_at = time.monotonic()
+        self.status_changed.emit("offline", "連線中斷，正在嘗試重新連線。")
 
     def _on_message(self, client, userdata, mqtt_message):
         if client is not self.client:
@@ -184,6 +209,68 @@ class MqttBridge(QObject):
             return int(reason_code) == 0
         except (TypeError, ValueError):
             return str(reason_code).lower() in {"success", "0"}
+
+    def _start_client(self):
+        broker_url = self.broker_url
+        parsed = urlparse(broker_url)
+        host = parsed.hostname
+        port = parsed.port or (8884 if parsed.scheme == "wss" else 8000)
+        path = parsed.path or "/mqtt"
+
+        if not host:
+            self.status_changed.emit("error", "Broker URL 缺少 host。")
+            return
+
+        if self.client:
+            old_client = self.client
+            self.client = None
+            old_client.disconnect()
+            old_client.loop_stop()
+
+        self.room_ready = False
+        self.pending_subscribe_mid = None
+        self.connect_started_at = time.monotonic()
+
+        client_id = f"python-qt-chat-{random.randrange(16**8):08x}-{int(time.time())}"
+        client = self._create_client(client_id)
+        client.ws_set_options(path=path)
+        client.reconnect_delay_set(min_delay=1, max_delay=4)
+        client.max_inflight_messages_set(20)
+        client.max_queued_messages_set(50)
+
+        if parsed.scheme == "wss":
+            client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+
+        client.on_connect = self._on_connect
+        client.on_connect_fail = self._on_connect_fail
+        client.on_disconnect = self._on_disconnect
+        client.on_subscribe = self._on_subscribe
+        client.on_message = self._on_message
+
+        self.client = client
+        self.status_changed.emit("connecting", f"連線中：{host}:{port}")
+
+        client.connect_async(host, port, keepalive=45)
+        client.loop_start()
+        self.watchdog.start()
+
+    def _restart_same_broker(self, reason: str):
+        if not self.broker_url or not self.invite_code:
+            return
+
+        self.status_changed.emit("connecting", f"{reason}，正在重新連同一個 broker。")
+        self._start_client()
+
+    def _watch_connection(self):
+        if not self.invite_code or not self.broker_url:
+            self.watchdog.stop()
+            return
+
+        if self.room_ready:
+            return
+
+        if time.monotonic() - self.connect_started_at >= 8:
+            self._restart_same_broker("連線或訂閱逾時")
 
 
 class GuideCard(QFrame):
@@ -295,7 +382,7 @@ class ChatWindow(QMainWindow):
         guide_row = QHBoxLayout()
         guide_row.setSpacing(10)
         guide_row.addWidget(GuideCard("1", "填入房間代碼", "同一組 invite code 就會進同一間聊天室。"))
-        guide_row.addWidget(GuideCard("2", "按加入聊天室", "連線成功後，下方輸入框會自動啟用。"))
+        guide_row.addWidget(GuideCard("2", "按加入聊天室", "訂閱成功後，下方輸入框會自動啟用。"))
         guide_row.addWidget(GuideCard("3", "開始傳訊息", "按 Enter 或傳送，其他同房間的人會即時看到。"))
         hero_layout.addLayout(guide_row, 2, 0, 1, 3)
 
@@ -561,6 +648,7 @@ class ChatWindow(QMainWindow):
         color = {
             "connected": "#12715e",
             "connecting": "#a66512",
+            "subscribing": "#1b6ea8",
             "offline": "#b63d38",
             "error": "#b63d38",
             "disconnected": "#6f7c88",
@@ -575,7 +663,7 @@ class ChatWindow(QMainWindow):
             font-weight: 850;
             """
         )
-        self._set_connected(state == "connected")
+        self._set_connection_state(state)
 
     def on_message_received(self, message: IncomingMessage):
         if self.empty_hint_item:
@@ -584,7 +672,8 @@ class ChatWindow(QMainWindow):
 
         payload = message.payload
         message_type = payload.get("type")
-        user = payload.get("user", "unknown")
+        raw_user = str(payload.get("user") or "unknown").strip() or "unknown"
+        is_mine = raw_user == self.current_user
 
         if message_type == "image":
             url = self._escape_html(payload.get("url", ""))
@@ -596,8 +685,7 @@ class ChatWindow(QMainWindow):
         else:
             body = self._escape_html(payload.get("content", ""))
 
-        display_user = "你" if user == self.current_user else user
-        self.add_bubble(display_user, message.received_at, body, user == self.current_user, message_type)
+        self.add_bubble(raw_user, message.received_at, body, is_mine, message_type)
 
     def show_empty_hint(self):
         if self.message_list.count() > 0:
@@ -649,6 +737,21 @@ class ChatWindow(QMainWindow):
         self.invite_input.setEnabled(not connected)
         self.user_input.setEnabled(not connected)
         self.broker_input.setEnabled(not connected)
+
+        if connected:
+            self.message_input.setFocus()
+
+    def _set_connection_state(self, state: str):
+        connected = state == "connected"
+        actively_trying = state in {"connecting", "subscribing", "offline", "error"}
+
+        self.message_input.setEnabled(connected)
+        self.send_button.setEnabled(connected)
+        self.leave_button.setEnabled(connected or actively_trying)
+        self.join_button.setEnabled(not connected and not actively_trying)
+        self.invite_input.setEnabled(not connected and not actively_trying)
+        self.user_input.setEnabled(not connected and not actively_trying)
+        self.broker_input.setEnabled(not connected and not actively_trying)
 
         if connected:
             self.message_input.setFocus()
